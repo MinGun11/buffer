@@ -2,8 +2,10 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <iostream>
 #include <string>
+#include <cstdio>
 
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
@@ -11,205 +13,203 @@
 
 using namespace geode::prelude;
 
-namespace BufferCore {
-    // Stages: 0 = OFF, 1 = 4 Ticks, 2 = 8 Ticks, 3 = 16 Ticks, 4 = 32 Ticks
-    int stageGround = 2; // Default: 4 Ticks
-    int stageWave   = 2; // Default: 4 Ticks
-    int stageShip   = 0; // Default: OFF
-    bool hazardSaver = true;
+namespace BufferEngine {
+    // F6 Master Stages:
+    // 0 = OFF
+    // 1 = LIGHT (4 Ticks)
+    // 2 = MEDIUM (8 Ticks)
+    // 3 = VORTEX (16 Ticks)
+    // 4 = EXTREME (32 Ticks)
+    // 5 = CUSTOM (Uses mod.json sliders)
+    int masterStage = 3; // Starts in VORTEX (16 Ticks) by default
 
-    int pendingPressP1 = 0;
-    int pendingPressP2 = 0;
-    bool isHoldingP1 = false;
-    bool isHoldingP2 = false;
+    int bonusGroundTicks = 0;
+    int bonusWaveTicks   = 0;
+    bool hazardSaverEnabled = true;
 
-    bool internalLock = false;
+    // Per-player tracking
+    bool holdingP1 = false;
+    bool holdingP2 = false;
 
-    int stageToTicks(int stage) {
-        switch (stage) {
-            case 1: return 4;
-            case 2: return 8;
-            case 3: return 16;
-            case 4: return 32;
-            default: return 0;
-        }
-    }
+    int pressBufferP1 = 0;
+    int releaseBufferP1 = 0;
+    int pressBufferP2 = 0;
+    int releaseBufferP2 = 0;
 
-    void writeLiveConsole(const std::string& msg) {
+    int saveCooldownP1 = 0;
+    int saveCooldownP2 = 0;
+
+    bool internalBypass = false;
+
+    void sendToCMD(const std::string& text) {
 #ifdef GEODE_IS_WINDOWS
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
         if (hOut && hOut != INVALID_HANDLE_VALUE) {
             DWORD written = 0;
-            WriteConsoleA(hOut, msg.c_str(), static_cast<DWORD>(msg.length()), &written, NULL);
+            WriteConsoleA(hOut, text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr);
         }
 #endif
+        std::cout << text << std::flush;
+        log::info("{}", text);
     }
 
-    void printBanner() {
-        std::string banner = 
-            "\n================================================================================\n"
-            "          PREDICTIVE INPUT BUFFER - LIVE CONSOLE (HARMFULFOID REPLICA)          \n"
-            "================================================================================\n"
-            " [HOTKEYS]\n"
-            "   [F1] Ground / Orb / Robot / Spider : Cycle Ticks (OFF -> 4t -> 8t -> 16t -> 32t)\n"
-            "   [F2] Wave Corridor Buffer          : Cycle Ticks (OFF -> 4t -> 8t -> 16t -> 32t)\n"
-            "   [F3] Ship / UFO / Swing Dynamics   : Cycle Ticks (OFF -> 4t -> 8t -> 16t -> 32t)\n"
-            "   [F4] Hazard Spike Interceptor      : Toggle ON / OFF\n"
-            "   [F7] VORTEX MODE (ALL MAX 16t)     : Instant Engage\n"
-            "================================================================================\n";
-        writeLiveConsole(banner);
-    }
-
-    void logStageChange(const char* name, int stage, int ticks) {
-        char buf[256];
-        if (stage == 0) {
-            snprintf(buf, sizeof(buf), "[BUFFER] [%s] -> STAGE 0: OFF [RAW Input]\n", name);
-        } else {
-            snprintf(buf, sizeof(buf), "[BUFFER] [%s] -> STAGE %d: %d Ticks (%.2f Frames @ 240fps)\n", 
-                name, stage, ticks, ticks * (240.0f / 60.0f));
+    const char* getStageTitle(int stage) {
+        switch (stage) {
+            case 0: return "STAGE 0: OFF (Raw Input)";
+            case 1: return "STAGE 1: LIGHT (4 Ticks)";
+            case 2: return "STAGE 2: MEDIUM (8 Ticks)";
+            case 3: return "STAGE 3: VORTEX (16 Ticks)";
+            case 4: return "STAGE 4: EXTREME (32 Ticks)";
+            case 5: return "STAGE 5: CUSTOM (Geode Settings)";
+            default: return "UNKNOWN";
         }
-        writeLiveConsole(buf);
     }
 
-    void logHazardSave(const char* mode, int ticks, const char* playerStr) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[BUFFER] *** SAVED AT %d TICKS HAZARD (%s) [%s] (Deflected) ***\n", 
-            ticks, playerStr, mode);
-        writeLiveConsole(buf);
+    int getBaseTicks(bool isWaveOrShip) {
+        if (!Mod::get()->getSettingValue<bool>("enabled") || masterStage == 0) {
+            return 0;
+        }
+        int base = 0;
+        switch (masterStage) {
+            case 1: base = 4; break;
+            case 2: base = 8; break;
+            case 3: base = 16; break;
+            case 4: base = 32; break;
+            case 5:
+            default:
+                base = isWaveOrShip
+                    ? static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"))
+                    : static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
+                break;
+        }
+        int extra = isWaveOrShip ? bonusWaveTicks : bonusGroundTicks;
+        int total = base + extra;
+        return (total < 0) ? 0 : total;
     }
 
-    bool isWave(PlayerObject* p) {
-        return p && p->m_isDart;
-    }
-
-    bool isContinuous(PlayerObject* p) {
-        return p && (p->m_isShip || p->m_isDart || p->m_isSwing);
+    bool isContinuousMode(PlayerObject* p) {
+        return p && (p->m_isDart || p->m_isShip || p->m_isSwing);
     }
 
     int getTicksForPlayer(PlayerObject* p) {
         if (!p) return 0;
-        if (p->m_isDart) return stageToTicks(stageWave);
-        if (p->m_isShip || p->m_isBird || p->m_isSwing) return stageToTicks(stageShip);
-        return stageToTicks(stageGround);
+        return getBaseTicks(isContinuousMode(p));
+    }
+
+    void printLiveHUD() {
+        int gTicks = getBaseTicks(false);
+        int wTicks = getBaseTicks(true);
+        char buf[1024];
+        std::snprintf(
+            buf, sizeof(buf),
+            "\n======================================================================\n"
+            "   PREDICTIVE BUFFER VORTEX - LIVE DEVELOPER CONSOLE\n"
+            "======================================================================\n"
+            "  ACTIVE F6 MODE       : %s\n"
+            "  CUBE/ORB/SPIDER/BALL : %d Ticks\n"
+            "  WAVE/SHIP/SWING      : %d Ticks\n"
+            "  100-FP HAZARD SAVER  : %s\n"
+            "----------------------------------------------------------------------\n"
+            "  [F6] Cycle Mode (OFF -> 4t -> 8t -> 16t VORTEX -> 32t -> CUSTOM)\n"
+            "  [F7] Instant Toggle VORTEX (16t) / CUSTOM\n"
+            "  [F1] +4 Ground/Orb Ticks  | [F2] +4 Wave/Ship Ticks\n"
+            "  [F3] Reset Bonus Ticks    | [F4] Toggle Hazard Spike Saver\n"
+            "======================================================================\n",
+            getStageTitle(masterStage),
+            gTicks,
+            wTicks,
+            hazardSaverEnabled ? "ENABLED (Auto-Deflect ON)" : "DISABLED"
+        );
+        sendToCMD(buf);
+    }
+
+    void logAction(const char* tag, const char* details, int ticks) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "[BUFFER] [%s] %s (Window: %d ticks)\n", tag, details, ticks);
+        sendToCMD(buf);
+    }
+
+    void initConsole() {
+#ifdef GEODE_IS_WINDOWS
+        if (Mod::get()->getSettingValue<bool>("open-console")) {
+            if (AllocConsole()) {
+                FILE* fDummy = nullptr;
+                freopen_s(&fDummy, "CONOUT$", "w", stdout);
+                freopen_s(&fDummy, "CONOUT$", "w", stderr);
+            }
+            SetConsoleTitleA("Geode - Predictive Buffer Vortex (F6 / F7 Live Console)");
+        }
+#endif
+        hazardSaverEnabled = Mod::get()->getSettingValue<bool>("smart-prediction");
+        printLiveHUD();
+    }
+
+    void handleHotkey(int key) {
+        if (key == 6) { // F6
+            masterStage = (masterStage + 1) % 6;
+            printLiveHUD();
+        } else if (key == 7) { // F7
+            masterStage = (masterStage == 3) ? 5 : 3;
+            printLiveHUD();
+        } else if (key == 1) { // F1
+            bonusGroundTicks = (bonusGroundTicks + 4) % 36;
+            printLiveHUD();
+        } else if (key == 2) { // F2
+            bonusWaveTicks = (bonusWaveTicks + 4) % 36;
+            printLiveHUD();
+        } else if (key == 3) { // F3
+            bonusGroundTicks = 0;
+            bonusWaveTicks = 0;
+            printLiveHUD();
+        } else if (key == 4) { // F4
+            hazardSaverEnabled = !hazardSaverEnabled;
+            printLiveHUD();
+        }
     }
 }
 
 $on_mod(Loaded) {
-#ifdef GEODE_IS_WINDOWS
-    if (Mod::get()->getSettingValue<bool>("open-console")) {
-        if (AllocConsole()) {
-            SetConsoleTitleA("Geode - Predictive Input Buffer - Live Console");
-            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-            DWORD dwMode = 0;
-            if (GetConsoleMode(hOut, &dwMode)) {
-                SetConsoleMode(hOut, dwMode | 0x0004); // ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            }
-        }
-    }
-#endif
-    BufferCore::printBanner();
+    BufferEngine::initConsole();
 }
 
-// Global hotkey listener for F1, F2, F3, F4, F7
-class $modify(BufferGameHook, GJBaseGameLayer) {
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-
-#ifdef GEODE_IS_WINDOWS
-        static bool f1Down = false, f2Down = false, f3Down = false, f4Down = false, f7Down = false;
-
-        if (GetAsyncKeyState(VK_F1) & 0x8000) {
-            if (!f1Down) {
-                f1Down = true;
-                BufferCore::stageGround = (BufferCore::stageGround + 1) % 5;
-                BufferCore::logStageChange("F1: GROUND / ORB / PAD / SPIDER", BufferCore::stageGround, BufferCore::stageToTicks(BufferCore::stageGround));
+// 1. Global Keyboard Hook (Works in menus, pause screen, and inside levels)
+class $modify(BufferKeyHook, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
+        if (isKeyDown && !isKeyRepeat) {
+            if (key == enumKeyCodes::KEY_F6) {
+                BufferEngine::handleHotkey(6);
+            } else if (key == enumKeyCodes::KEY_F7) {
+                BufferEngine::handleHotkey(7);
+            } else if (key == enumKeyCodes::KEY_F1) {
+                BufferEngine::handleHotkey(1);
+            } else if (key == enumKeyCodes::KEY_F2) {
+                BufferEngine::handleHotkey(2);
+            } else if (key == enumKeyCodes::KEY_F3) {
+                BufferEngine::handleHotkey(3);
+            } else if (key == enumKeyCodes::KEY_F4) {
+                BufferEngine::handleHotkey(4);
             }
-        } else { f1Down = false; }
-
-        if (GetAsyncKeyState(VK_F2) & 0x8000) {
-            if (!f2Down) {
-                f2Down = true;
-                BufferCore::stageWave = (BufferCore::stageWave + 1) % 5;
-                BufferCore::logStageChange("F2: WAVE", BufferCore::stageWave, BufferCore::stageToTicks(BufferCore::stageWave));
-            }
-        } else { f2Down = false; }
-
-        if (GetAsyncKeyState(VK_F3) & 0x8000) {
-            if (!f3Down) {
-                f3Down = true;
-                BufferCore::stageShip = (BufferCore::stageShip + 1) % 5;
-                BufferCore::logStageChange("F3: SHIP / UFO / SWING", BufferCore::stageShip, BufferCore::stageToTicks(BufferCore::stageShip));
-            }
-        } else { f3Down = false; }
-
-        if (GetAsyncKeyState(VK_F4) & 0x8000) {
-            if (!f4Down) {
-                f4Down = true;
-                BufferCore::hazardSaver = !BufferCore::hazardSaver;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "[BUFFER] [F4: HAZARD SPIKE SAVER] -> %s\n", BufferCore::hazardSaver ? "ENABLED" : "DISABLED");
-                BufferCore::writeLiveConsole(buf);
-            }
-        } else { f4Down = false; }
-
-        if (GetAsyncKeyState(VK_F7) & 0x8000) {
-            if (!f7Down) {
-                f7Down = true;
-                BufferCore::stageGround = 3; // 16 Ticks
-                BufferCore::stageWave   = 3; // 16 Ticks
-                BufferCore::stageShip   = 3; // 16 Ticks
-                BufferCore::hazardSaver = true;
-                BufferCore::writeLiveConsole("[BUFFER] [F7: VORTEX (ALL MODES) -> ENGAGED (16 Ticks)]\n");
-            }
-        } else { f7Down = false; }
-#endif
-
-        auto pl = PlayLayer::get();
-        if (!pl || this != static_cast<GJBaseGameLayer*>(pl)) return;
-
-        auto stepBuffer = [&](PlayerObject* player, int& pendingPress, bool isHolding) {
-            if (!player) return;
-            if (pendingPress > 0) {
-                pendingPress--;
-                BufferCore::internalLock = true;
-
-                if (player->m_isOnGround || player->m_isBird || player->m_isSwing) {
-                    player->pushButton(PlayerButton::Jump);
-                    if (player->m_isOnGround && !BufferCore::isContinuous(player)) {
-                        pendingPress = 0;
-                    }
-                } else {
-                    // Auto-trigger jump rings / pads during active buffer ticks (Orb Spam fix)
-                    player->ringJump(nullptr, false);
-                }
-
-                BufferCore::internalLock = false;
-            }
-        };
-
-        stepBuffer(pl->m_player1, BufferCore::pendingPressP1, BufferCore::isHoldingP1);
-        if (pl->m_gameState.m_isDualMode) {
-            stepBuffer(pl->m_player2, BufferCore::pendingPressP2, BufferCore::isHoldingP2);
         }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }
 };
 
-// Track player clicks and assign active lookahead ticks
+// 2. Player Input Hook: Captures early clicks & releases into the tick buffer
 class $modify(BufferPlayerHook, PlayerObject) {
     bool pushButton(PlayerButton btn) {
-        if (BufferCore::internalLock || btn != PlayerButton::Jump) {
+        if (BufferEngine::internalBypass || btn != PlayerButton::Jump) {
             return PlayerObject::pushButton(btn);
         }
 
         auto pl = PlayLayer::get();
         if (pl) {
-            int ticks = BufferCore::getTicksForPlayer(this);
+            int maxTicks = BufferEngine::getTicksForPlayer(this);
             if (this == pl->m_player1) {
-                BufferCore::isHoldingP1 = true;
-                if (ticks > 0) BufferCore::pendingPressP1 = ticks;
+                BufferEngine::holdingP1 = true;
+                if (maxTicks > 0) BufferEngine::pressBufferP1 = maxTicks;
             } else if (this == pl->m_player2) {
-                BufferCore::isHoldingP2 = true;
-                if (ticks > 0) BufferCore::pendingPressP2 = ticks;
+                BufferEngine::holdingP2 = true;
+                if (maxTicks > 0) BufferEngine::pressBufferP2 = maxTicks;
             }
         }
 
@@ -217,97 +217,209 @@ class $modify(BufferPlayerHook, PlayerObject) {
     }
 
     bool releaseButton(PlayerButton btn) {
-        if (BufferCore::internalLock || btn != PlayerButton::Jump) {
+        if (BufferEngine::internalBypass || btn != PlayerButton::Jump) {
             return PlayerObject::releaseButton(btn);
         }
 
         auto pl = PlayLayer::get();
         if (pl) {
-            if (this == pl->m_player1) BufferCore::isHoldingP1 = false;
-            else if (this == pl->m_player2) BufferCore::isHoldingP2 = false;
+            int maxTicks = BufferEngine::getTicksForPlayer(this);
+            if (this == pl->m_player1) {
+                BufferEngine::holdingP1 = false;
+                if (maxTicks > 0) BufferEngine::releaseBufferP1 = maxTicks;
+            } else if (this == pl->m_player2) {
+                BufferEngine::holdingP2 = false;
+                if (maxTicks > 0) BufferEngine::releaseBufferP2 = maxTicks;
+            }
         }
 
         return PlayerObject::releaseButton(btn);
     }
 };
 
-// Intercept lethal hazards (Spikes, Wave Corridors, 100 Frame-Perfects)
+// 3. Per-Tick Physics Command Hook: Solves Orb Spam, Spider/Ball Flips, UFO, and Early Ground Jumps
+class $modify(BufferCommandHook, GJBaseGameLayer) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+
+        auto pl = PlayLayer::get();
+        if (!pl || this != static_cast<GJBaseGameLayer*>(pl)) return;
+        if (!Mod::get()->getSettingValue<bool>("enabled") || BufferEngine::masterStage == 0) return;
+
+        auto processPlayerTick = [&](PlayerObject* p, int& pressBuf, int& releaseBuf, int& cooldown, bool isHolding) {
+            if (!p || p->m_isDead) return;
+            if (cooldown > 0) cooldown--;
+
+            if (pressBuf > 0) {
+                pressBuf--;
+
+                // For non-continuous modes (Cube, Orbs, Robot, Spider, Ball, UFO):
+                // Re-pulsing releaseButton -> pushButton forces GD's native ringJump and ground/spider
+                // checks to fire on the exact first sub-tick you enter an orb hitbox or touch ground!
+                if (!BufferEngine::isContinuousMode(p) && isHolding) {
+                    BufferEngine::internalBypass = true;
+
+                    double velBefore = p->m_yVelocity;
+                    bool groundBefore = p->m_isOnGround;
+                    bool upsideBefore = p->m_isUpsideDown;
+
+                    p->releaseButton(PlayerButton::Jump);
+                    p->pushButton(PlayerButton::Jump);
+
+                    // If the re-pulse triggered a jump, orb, or gravity flip, consume the buffer
+                    if (p->m_yVelocity != velBefore || (groundBefore && !p->m_isOnGround) || p->m_isUpsideDown != upsideBefore) {
+                        pressBuf = 0;
+                    }
+
+                    BufferEngine::internalBypass = false;
+                }
+            }
+
+            if (releaseBuf > 0) {
+                releaseBuf--;
+            }
+        };
+
+        processPlayerTick(
+            pl->m_player1,
+            BufferEngine::pressBufferP1,
+            BufferEngine::releaseBufferP1,
+            BufferEngine::saveCooldownP1,
+            BufferEngine::holdingP1
+        );
+
+        if (pl->m_gameState.m_isDualMode) {
+            processPlayerTick(
+                pl->m_player2,
+                BufferEngine::pressBufferP2,
+                BufferEngine::releaseBufferP2,
+                BufferEngine::saveCooldownP2,
+                BufferEngine::holdingP2
+            );
+        }
+    }
+};
+
+// 4. Hazard & 100 Frame-Perfect Interceptor: Saves late jumps and tight Wave/Ship/Swing corridors
 class $modify(BufferPlayLayerHook, PlayLayer) {
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        BufferEngine::pressBufferP1 = 0;
+        BufferEngine::releaseBufferP1 = 0;
+        BufferEngine::pressBufferP2 = 0;
+        BufferEngine::releaseBufferP2 = 0;
+        BufferEngine::saveCooldownP1 = 0;
+        BufferEngine::saveCooldownP2 = 0;
+        return true;
+    }
+
     void resetLevel() {
-        BufferCore::pendingPressP1 = 0;
-        BufferCore::pendingPressP2 = 0;
-        BufferCore::isHoldingP1 = false;
-        BufferCore::isHoldingP2 = false;
+        BufferEngine::pressBufferP1 = 0;
+        BufferEngine::releaseBufferP1 = 0;
+        BufferEngine::pressBufferP2 = 0;
+        BufferEngine::releaseBufferP2 = 0;
+        BufferEngine::saveCooldownP1 = 0;
+        BufferEngine::saveCooldownP2 = 0;
         PlayLayer::resetLevel();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        // Let RobTop's anticheat test spike proceed uninterrupted
+        // Always allow RobTop's anticheat check spike on level start
         if (!player || object == m_anticheatSpike) {
             PlayLayer::destroyPlayer(player, object);
             return;
         }
 
-        if (!BufferCore::hazardSaver) {
+        if (!Mod::get()->getSettingValue<bool>("enabled") ||
+            BufferEngine::masterStage == 0 ||
+            !BufferEngine::hazardSaverEnabled) {
             PlayLayer::destroyPlayer(player, object);
             return;
         }
 
-        int activeTicks = BufferCore::getTicksForPlayer(player);
-        if (activeTicks <= 0) {
+        int maxTicks = BufferEngine::getTicksForPlayer(player);
+        if (maxTicks <= 0) {
             PlayLayer::destroyPlayer(player, object);
             return;
         }
 
         bool isP1 = (player == m_player1);
-        bool isHolding = isP1 ? BufferCore::isHoldingP1 : BufferCore::isHoldingP2;
-        int& pendingPress = isP1 ? BufferCore::pendingPressP1 : BufferCore::pendingPressP2;
+        int& pressBuf   = isP1 ? BufferEngine::pressBufferP1   : BufferEngine::pressBufferP2;
+        int& releaseBuf = isP1 ? BufferEngine::releaseBufferP1 : BufferEngine::releaseBufferP2;
+        int& cooldown   = isP1 ? BufferEngine::saveCooldownP1  : BufferEngine::saveCooldownP2;
+        bool& isHolding = isP1 ? BufferEngine::holdingP1       : BufferEngine::holdingP2;
 
-        BufferCore::internalLock = true;
-        player->m_isDead = false;
-        double gravDir = player->m_isUpsideDown ? -1.0 : 1.0;
+        // If cooldown is within our active tick allowance, intercept the hazard
+        if (cooldown <= maxTicks) {
+            BufferEngine::internalBypass = true;
+            player->m_isDead = false;
+            double grav = player->m_isUpsideDown ? -1.0 : 1.0;
 
-        if (BufferCore::isWave(player)) {
-            // Wave corridor deflection: Invert hold state and nudge away from slope/spike
-            if (isHolding) {
-                player->releaseButton(PlayerButton::Jump);
-                player->setPositionY(player->getPositionY() - 3.5f * static_cast<float>(gravDir));
-            } else {
-                player->pushButton(PlayerButton::Jump);
-                player->setPositionY(player->getPositionY() + 3.5f * static_cast<float>(gravDir));
+            if (player->m_isDart) {
+                // WAVE MODE: Corridor deflection (Invert hold/release and step out of hitbox)
+                if (isHolding) {
+                    player->releaseButton(PlayerButton::Jump);
+                    isHolding = false;
+                    player->setPositionY(player->getPositionY() - static_cast<float>(3.2 * grav));
+                } else {
+                    player->pushButton(PlayerButton::Jump);
+                    isHolding = true;
+                    player->setPositionY(player->getPositionY() + static_cast<float>(3.2 * grav));
+                }
+                cooldown += 2;
+                BufferEngine::logAction("WAVE SAVE", "Deflected corridor hitbox", maxTicks);
+                BufferEngine::internalBypass = false;
+                return;
             }
-            BufferCore::logHazardSave("WAVE CORRIDOR", activeTicks, isP1 ? "P1" : "P2");
-            BufferCore::internalLock = false;
+
+            if (player->m_isShip || player->m_isSwing) {
+                // SHIP / SWING MODE: Invert vertical thrust and clear obstacle boundary
+                if (isHolding) {
+                    player->releaseButton(PlayerButton::Jump);
+                    player->m_yVelocity = -4.5 * grav;
+                    player->setPositionY(player->getPositionY() - static_cast<float>(3.5 * grav));
+                } else {
+                    player->pushButton(PlayerButton::Jump);
+                    player->m_yVelocity = 4.5 * grav;
+                    player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
+                }
+                cooldown += 2;
+                BufferEngine::logAction("SHIP/SWING SAVE", "Adjusted flight vector", maxTicks);
+                BufferEngine::internalBypass = false;
+                return;
+            }
+
+            if (player->m_isBall || player->m_isSpider) {
+                // BALL / SPIDER: Force ground state and execute gravity flip / teleport
+                player->m_isOnGround = true;
+                player->releaseButton(PlayerButton::Jump);
+                player->pushButton(PlayerButton::Jump);
+                player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
+                pressBuf = 0;
+                cooldown += 3;
+                BufferEngine::logAction("BALL/SPIDER SAVE", "Executed frame-perfect flip", maxTicks);
+                BufferEngine::internalBypass = false;
+                return;
+            }
+
+            // CUBE / ROBOT / UFO: Execute 100-frame-perfect ground jump or orb hit on spike contact
+            player->m_isOnGround = true;
+            player->releaseButton(PlayerButton::Jump);
+            player->pushButton(PlayerButton::Jump);
+
+            if (player->m_yVelocity * grav < 10.5) {
+                player->m_yVelocity = 11.2 * grav;
+            }
+            player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
+            pressBuf = 0;
+            releaseBuf = 0;
+            cooldown += 3;
+
+            BufferEngine::logAction("FRAME-PERFECT SAVE", "Triggered jump on spike hitbox", maxTicks);
+            BufferEngine::internalBypass = false;
             return;
         }
 
-        if (player->m_isShip || player->m_isSwing) {
-            // Ship / Swing thrust deflection
-            if (isHolding) {
-                player->releaseButton(PlayerButton::Jump);
-                player->setPositionY(player->getPositionY() - 4.0f * static_cast<float>(gravDir));
-            } else {
-                player->pushButton(PlayerButton::Jump);
-                player->setPositionY(player->getPositionY() + 4.0f * static_cast<float>(gravDir));
-            }
-            BufferCore::logHazardSave("SHIP/SWING", activeTicks, isP1 ? "P1" : "P2");
-            BufferCore::internalLock = false;
-            return;
-        }
-
-        // Cube, Robot, Spider, Ball, UFO: Force frame-perfect jump/flip on spike contact
-        player->m_isOnGround = true;
-        player->m_touchingGround = true;
-        player->pushButton(PlayerButton::Jump);
-        player->ringJump(nullptr, false);
-
-        if (player->m_yVelocity * gravDir < 10.0) {
-            player->m_yVelocity = 11.5 * gravDir;
-        }
-        player->setPositionY(player->getPositionY() + 4.0f * static_cast<float>(gravDir));
-        pendingPress = 0;
-
-        BufferCore::logHazardSave("GROUND / FRAME PERFECT", activeTicks, isP1 ? "P1" : "P2");
-        BufferCore::internalLock = false;
+        PlayLayer::destroyPlayer(player, object);
     }
 };
