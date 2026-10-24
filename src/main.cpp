@@ -2,10 +2,11 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <iostream>
 #include <string>
 #include <cstdio>
+#include <thread>
+#include <chrono>
 
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
@@ -15,19 +16,19 @@ using namespace geode::prelude;
 
 namespace BufferEngine {
     // F6 Master Stages:
-    // 0 = OFF
+    // 0 = OFF (0 Ticks)
     // 1 = LIGHT (4 Ticks)
     // 2 = MEDIUM (8 Ticks)
     // 3 = VORTEX (16 Ticks)
     // 4 = EXTREME (32 Ticks)
-    // 5 = CUSTOM (Uses mod.json sliders)
-    int masterStage = 3; // Starts in VORTEX (16 Ticks) by default
+    // 5 = GOD MODE / CUSTOM (Uses mod.json sliders or 120/40 fallback)
+    int masterStage = 3; // Starts in STAGE 3: VORTEX (16 Ticks)
 
     int bonusGroundTicks = 0;
     int bonusWaveTicks   = 0;
-    bool hazardSaverEnabled = true;
+    bool hazardSaverEnabled = true; // Forced ON by default!
 
-    // Per-player tracking
+    // Per-player state
     bool holdingP1 = false;
     bool holdingP2 = false;
 
@@ -40,6 +41,7 @@ namespace BufferEngine {
     int saveCooldownP2 = 0;
 
     bool internalBypass = false;
+    bool threadRunning = false;
 
     void sendToCMD(const std::string& text) {
 #ifdef GEODE_IS_WINDOWS
@@ -47,10 +49,10 @@ namespace BufferEngine {
         if (hOut && hOut != INVALID_HANDLE_VALUE) {
             DWORD written = 0;
             WriteConsoleA(hOut, text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr);
+            return;
         }
 #endif
         std::cout << text << std::flush;
-        log::info("{}", text);
     }
 
     const char* getStageTitle(int stage) {
@@ -60,31 +62,39 @@ namespace BufferEngine {
             case 2: return "STAGE 2: MEDIUM (8 Ticks)";
             case 3: return "STAGE 3: VORTEX (16 Ticks)";
             case 4: return "STAGE 4: EXTREME (32 Ticks)";
-            case 5: return "STAGE 5: CUSTOM (Geode Settings)";
+            case 5: return "STAGE 5: CUSTOM / AUTOPILOT";
             default: return "UNKNOWN";
         }
     }
 
     int getBaseTicks(bool isWaveOrShip) {
-        if (!Mod::get()->getSettingValue<bool>("enabled") || masterStage == 0) {
+        if (masterStage == 0) {
             return 0;
         }
-        int base = 0;
+
+        int base = 16;
         switch (masterStage) {
             case 1: base = 4; break;
             case 2: base = 8; break;
             case 3: base = 16; break;
             case 4: base = 32; break;
             case 5:
-            default:
-                base = isWaveOrShip
+            default: {
+                int customVal = isWaveOrShip
                     ? static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"))
                     : static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
+                // Fallback if Geode saved.json returned 0
+                if (customVal <= 0) {
+                    customVal = isWaveOrShip ? 40 : 120;
+                }
+                base = customVal;
                 break;
+            }
         }
+
         int extra = isWaveOrShip ? bonusWaveTicks : bonusGroundTicks;
         int total = base + extra;
-        return (total < 0) ? 0 : total;
+        return (total < 1) ? 1 : total;
     }
 
     bool isContinuousMode(PlayerObject* p) {
@@ -125,23 +135,8 @@ namespace BufferEngine {
 
     void logAction(const char* tag, const char* details, int ticks) {
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "[BUFFER] [%s] %s (Window: %d ticks)\n", tag, details, ticks);
+        std::snprintf(buf, sizeof(buf), "[BUFFER] [%s] %s (Active Window: %d ticks)\n", tag, details, ticks);
         sendToCMD(buf);
-    }
-
-    void initConsole() {
-#ifdef GEODE_IS_WINDOWS
-        if (Mod::get()->getSettingValue<bool>("open-console")) {
-            if (AllocConsole()) {
-                FILE* fDummy = nullptr;
-                freopen_s(&fDummy, "CONOUT$", "w", stdout);
-                freopen_s(&fDummy, "CONOUT$", "w", stderr);
-            }
-            SetConsoleTitleA("Geode - Predictive Buffer Vortex (F6 / F7 Live Console)");
-        }
-#endif
-        hazardSaverEnabled = Mod::get()->getSettingValue<bool>("smart-prediction");
-        printLiveHUD();
     }
 
     void handleHotkey(int key) {
@@ -152,10 +147,10 @@ namespace BufferEngine {
             masterStage = (masterStage == 3) ? 5 : 3;
             printLiveHUD();
         } else if (key == 1) { // F1
-            bonusGroundTicks = (bonusGroundTicks + 4) % 36;
+            bonusGroundTicks = (bonusGroundTicks + 4) % 64;
             printLiveHUD();
         } else if (key == 2) { // F2
-            bonusWaveTicks = (bonusWaveTicks + 4) % 36;
+            bonusWaveTicks = (bonusWaveTicks + 4) % 64;
             printLiveHUD();
         } else if (key == 3) { // F3
             bonusGroundTicks = 0;
@@ -166,35 +161,57 @@ namespace BufferEngine {
             printLiveHUD();
         }
     }
+
+    void startHotkeyThread() {
+        if (threadRunning) return;
+        threadRunning = true;
+#ifdef GEODE_IS_WINDOWS
+        std::thread([]() {
+            bool k1 = false, k2 = false, k3 = false, k4 = false, k6 = false, k7 = false;
+            while (true) {
+                auto checkKey = [](int vk, bool& state, int id) {
+                    if (GetAsyncKeyState(vk) & 0x8000) {
+                        if (!state) {
+                            state = true;
+                            handleHotkey(id);
+                        }
+                    } else {
+                        state = false;
+                    }
+                };
+                checkKey(VK_F1, k1, 1);
+                checkKey(VK_F2, k2, 2);
+                checkKey(VK_F3, k3, 3);
+                checkKey(VK_F4, k4, 4);
+                checkKey(VK_F6, k6, 6);
+                checkKey(VK_F7, k7, 7);
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }).detach();
+#endif
+    }
+
+    void initConsole() {
+#ifdef GEODE_IS_WINDOWS
+        if (AllocConsole()) {
+            FILE* fDummy = nullptr;
+            freopen_s(&fDummy, "CONOUT$", "w", stdout);
+            freopen_s(&fDummy, "CONOUT$", "w", stderr);
+        }
+        SetConsoleTitleA("Geode - Predictive Buffer Vortex (F6 / F7 Live Console)");
+#endif
+        masterStage = 3; // Guaranteed 16 Ticks on start
+        hazardSaverEnabled = true; // Guaranteed ON on start
+        printLiveHUD();
+        startHotkeyThread();
+    }
 }
 
 $on_mod(Loaded) {
     BufferEngine::initConsole();
 }
 
-// 1. Global Keyboard Hook (Works in menus, pause screen, and inside levels)
-class $modify(BufferKeyHook, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
-        if (isKeyDown && !isKeyRepeat) {
-            if (key == enumKeyCodes::KEY_F6) {
-                BufferEngine::handleHotkey(6);
-            } else if (key == enumKeyCodes::KEY_F7) {
-                BufferEngine::handleHotkey(7);
-            } else if (key == enumKeyCodes::KEY_F1) {
-                BufferEngine::handleHotkey(1);
-            } else if (key == enumKeyCodes::KEY_F2) {
-                BufferEngine::handleHotkey(2);
-            } else if (key == enumKeyCodes::KEY_F3) {
-                BufferEngine::handleHotkey(3);
-            } else if (key == enumKeyCodes::KEY_F4) {
-                BufferEngine::handleHotkey(4);
-            }
-        }
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
-    }
-};
-
-// 2. Player Input Hook: Captures early clicks & releases into the tick buffer
+// 1. Player Input Hook: Captures early clicks & releases into the tick buffer
 class $modify(BufferPlayerHook, PlayerObject) {
     bool pushButton(PlayerButton btn) {
         if (BufferEngine::internalBypass || btn != PlayerButton::Jump) {
@@ -202,7 +219,7 @@ class $modify(BufferPlayerHook, PlayerObject) {
         }
 
         auto pl = PlayLayer::get();
-        if (pl) {
+        if (pl && BufferEngine::masterStage != 0) {
             int maxTicks = BufferEngine::getTicksForPlayer(this);
             if (this == pl->m_player1) {
                 BufferEngine::holdingP1 = true;
@@ -222,7 +239,7 @@ class $modify(BufferPlayerHook, PlayerObject) {
         }
 
         auto pl = PlayLayer::get();
-        if (pl) {
+        if (pl && BufferEngine::masterStage != 0) {
             int maxTicks = BufferEngine::getTicksForPlayer(this);
             if (this == pl->m_player1) {
                 BufferEngine::holdingP1 = false;
@@ -237,14 +254,14 @@ class $modify(BufferPlayerHook, PlayerObject) {
     }
 };
 
-// 3. Per-Tick Physics Command Hook: Solves Orb Spam, Spider/Ball Flips, UFO, and Early Ground Jumps
+// 2. Per-Tick Physics Command Hook: Solves Orb Spam, Spider/Ball Flips, UFO, and Early Ground Jumps
 class $modify(BufferCommandHook, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
         auto pl = PlayLayer::get();
         if (!pl || this != static_cast<GJBaseGameLayer*>(pl)) return;
-        if (!Mod::get()->getSettingValue<bool>("enabled") || BufferEngine::masterStage == 0) return;
+        if (BufferEngine::masterStage == 0) return;
 
         auto processPlayerTick = [&](PlayerObject* p, int& pressBuf, int& releaseBuf, int& cooldown, bool isHolding) {
             if (!p || p->m_isDead) return;
@@ -253,7 +270,7 @@ class $modify(BufferCommandHook, GJBaseGameLayer) {
             if (pressBuf > 0) {
                 pressBuf--;
 
-                // For non-continuous modes (Cube, Orbs, Robot, Spider, Ball, UFO):
+                // For Cube, Orbs, Robot, Spider, Ball, UFO:
                 // Re-pulsing releaseButton -> pushButton forces GD's native ringJump and ground/spider
                 // checks to fire on the exact first sub-tick you enter an orb hitbox or touch ground!
                 if (!BufferEngine::isContinuousMode(p) && isHolding) {
@@ -266,8 +283,8 @@ class $modify(BufferCommandHook, GJBaseGameLayer) {
                     p->releaseButton(PlayerButton::Jump);
                     p->pushButton(PlayerButton::Jump);
 
-                    // If the re-pulse triggered a jump, orb, or gravity flip, consume the buffer
                     if (p->m_yVelocity != velBefore || (groundBefore && !p->m_isOnGround) || p->m_isUpsideDown != upsideBefore) {
+                        BufferEngine::logAction("BUFFERED INPUT", "Executed buffered Jump/Orb/Flip", pressBuf);
                         pressBuf = 0;
                     }
 
@@ -300,7 +317,7 @@ class $modify(BufferCommandHook, GJBaseGameLayer) {
     }
 };
 
-// 4. Hazard & 100 Frame-Perfect Interceptor: Saves late jumps and tight Wave/Ship/Swing corridors
+// 3. Hazard & 100 Frame-Perfect Interceptor: Saves late jumps and tight Wave/Ship/Swing corridors
 class $modify(BufferPlayLayerHook, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
@@ -330,9 +347,7 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
             return;
         }
 
-        if (!Mod::get()->getSettingValue<bool>("enabled") ||
-            BufferEngine::masterStage == 0 ||
-            !BufferEngine::hazardSaverEnabled) {
+        if (BufferEngine::masterStage == 0 || !BufferEngine::hazardSaverEnabled) {
             PlayLayer::destroyPlayer(player, object);
             return;
         }
@@ -349,7 +364,6 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
         int& cooldown   = isP1 ? BufferEngine::saveCooldownP1  : BufferEngine::saveCooldownP2;
         bool& isHolding = isP1 ? BufferEngine::holdingP1       : BufferEngine::holdingP2;
 
-        // If cooldown is within our active tick allowance, intercept the hazard
         if (cooldown <= maxTicks) {
             BufferEngine::internalBypass = true;
             player->m_isDead = false;
@@ -360,11 +374,11 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
                 if (isHolding) {
                     player->releaseButton(PlayerButton::Jump);
                     isHolding = false;
-                    player->setPositionY(player->getPositionY() - static_cast<float>(3.2 * grav));
+                    player->setPositionY(player->getPositionY() - static_cast<float>(3.5 * grav));
                 } else {
                     player->pushButton(PlayerButton::Jump);
                     isHolding = true;
-                    player->setPositionY(player->getPositionY() + static_cast<float>(3.2 * grav));
+                    player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
                 }
                 cooldown += 2;
                 BufferEngine::logAction("WAVE SAVE", "Deflected corridor hitbox", maxTicks);
@@ -377,11 +391,11 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
                 if (isHolding) {
                     player->releaseButton(PlayerButton::Jump);
                     player->m_yVelocity = -4.5 * grav;
-                    player->setPositionY(player->getPositionY() - static_cast<float>(3.5 * grav));
+                    player->setPositionY(player->getPositionY() - static_cast<float>(3.8 * grav));
                 } else {
                     player->pushButton(PlayerButton::Jump);
                     player->m_yVelocity = 4.5 * grav;
-                    player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
+                    player->setPositionY(player->getPositionY() + static_cast<float>(3.8 * grav));
                 }
                 cooldown += 2;
                 BufferEngine::logAction("SHIP/SWING SAVE", "Adjusted flight vector", maxTicks);
@@ -394,7 +408,7 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
                 player->m_isOnGround = true;
                 player->releaseButton(PlayerButton::Jump);
                 player->pushButton(PlayerButton::Jump);
-                player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
+                player->setPositionY(player->getPositionY() + static_cast<float>(3.8 * grav));
                 pressBuf = 0;
                 cooldown += 3;
                 BufferEngine::logAction("BALL/SPIDER SAVE", "Executed frame-perfect flip", maxTicks);
@@ -410,7 +424,7 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
             if (player->m_yVelocity * grav < 10.5) {
                 player->m_yVelocity = 11.2 * grav;
             }
-            player->setPositionY(player->getPositionY() + static_cast<float>(3.5 * grav));
+            player->setPositionY(player->getPositionY() + static_cast<float>(3.8 * grav));
             pressBuf = 0;
             releaseBuf = 0;
             cooldown += 3;
