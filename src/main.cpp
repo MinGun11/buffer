@@ -95,7 +95,7 @@ $on_mod(Loaded) {
 
 // Hotkeys F6 and F7 to switch buffer strength live in-game and update CMD console
 class $modify(BufferKeyHook, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat) {
             if (key == enumKeyCodes::KEY_F6) {
                 BufferState::currentStage = (BufferState::currentStage + 1) % 5;
@@ -105,7 +105,7 @@ class $modify(BufferKeyHook, CCKeyboardDispatcher) {
                 BufferState::printConsoleBanner();
             }
         }
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat);
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }
 };
 
@@ -160,8 +160,8 @@ class $modify(BufferPlayerHook, PlayerObject) {
 
 // Per-tick execution for Orb Spam, Spider/Ball flips, and Cube ground frames
 class $modify(BufferGameHook, GJBaseGameLayer) {
-    void processCommands(float dt) {
-        GJBaseGameLayer::processCommands(dt);
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
         auto pl = PlayLayer::get();
         if (!pl || this != static_cast<GJBaseGameLayer*>(pl)) return;
@@ -220,8 +220,8 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        // Note: GD calls destroyPlayer(player, m_anticheatSpike) on level start to test anticheat.
-        // Always let m_anticheatSpike pass straight through!
+        // GD calls destroyPlayer(player, m_anticheatSpike) on level start to test anticheat.
+        // Always let m_anticheatSpike pass straight through.
         if (!player || object == m_anticheatSpike) {
             PlayLayer::destroyPlayer(player, object);
             return;
@@ -234,7 +234,7 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
 
         bool isP1 = (player == m_player1);
         int& pressTicks = isP1 ? BufferState::pendingPressTicksP1 : BufferState::pendingPressTicksP2;
-        int& releaseTicks = isP1 ? BufferState::pendingReleaseTicksP2 : BufferState::pendingReleaseTicksP2;
+        int& releaseTicks = isP1 ? BufferState::pendingReleaseTicksP1 : BufferState::pendingReleaseTicksP2;
         int& cooldown = isP1 ? BufferState::hazardSaveCooldownP1 : BufferState::hazardSaveCooldownP2;
         bool isHolding = isP1 ? BufferState::holdingP1 : BufferState::holdingP2;
 
@@ -280,7 +280,7 @@ class $modify(BufferPlayLayerHook, PlayLayer) {
             }
 
             BufferState::internalInputLock = false;
-            return; // Saved by predictive buffer!
+            return; // Intercepted and saved!
         }
 
         PlayLayer::destroyPlayer(player, object);
