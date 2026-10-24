@@ -1,19 +1,47 @@
-cmake_minimum_required(VERSION 3.21)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-
-project(PredictiveBuffer VERSION 2.5.0)
-
-add_library(${PROJECT_NAME} SHARED
-    src/main.cpp
-)
-
-if (NOT DEFINED ENV{GEODE_SDK})
-    message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable")
-endif()
-
-add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
-
-setup_geode_mod(${PROJECT_NAME})
+{
+    "geode": "5.11.2",
+    "gd": {
+        "win": "2.2081"
+    },
+    "id": "ai.predictivebuffer",
+    "name": "Predictive Buffer Vortex",
+    "version": "v3.0.0",
+    "developer": "harmfulfoid",
+    "description": "All-mode predictive input buffer (Cube, Wave, Ship, Orbs, Spider, Ball, UFO, Swing) with F6/F7 Live CMD Console.",
+    "settings": {
+        "enabled": {
+            "type": "bool",
+            "name": "Enable Predictive Buffer",
+            "description": "Master switch for the predictive buffer.",
+            "default": true
+        },
+        "custom-ticks": {
+            "type": "int",
+            "name": "Custom Stage: Max Delay (Ticks)",
+            "description": "Tick window when F6 is set to CUSTOM mode (Cube, Orbs, Spider, Ball, Robot, UFO).",
+            "default": 60,
+            "min": 1,
+            "max": 300
+        },
+        "custom-wave-ticks": {
+            "type": "int",
+            "name": "Custom Stage: Max Wave/Ship Delay (Ticks)",
+            "description": "Wave/Ship/Swing tick window when F6 is set to CUSTOM mode.",
+            "default": 24,
+            "min": 1,
+            "max": 120
+        },
+        "smart-prediction": {
+            "type": "bool",
+            "name": "Hazard / 100 Frame-Perfect Saver",
+            "description": "Automatically deflects lethal spike/corridor hitboxes within your active tick budget.",
+            "default": true
+        },
+        "open-console": {
+            "type": "bool",
+            "name": "Open CMD Developer Console",
+            "description": "Opens the live CMD console window on launch.",
+            "default": true
+        }
+    }
+}
