@@ -1,0 +1,55 @@
+{
+    "geode": "5.11.2",
+    "gd": {
+        "win": "2.2081"
+    },
+    "id": "ai.predictivebuffer",
+    "name": "Predictive Buffer Vortex",
+    "version": "v2.5.0",
+    "developer": "PredictiveBuffer",
+    "description": "All-mode predictive input buffer (Cube, Wave, Ship, Orbs, Spider, Ball, UFO, Swing) with F6/F7 Console stages and hazard-reactive frame-perfect deflection.",
+    "settings": {
+        "enabled": {
+            "type": "bool",
+            "name": "Enable Buffer",
+            "description": "Master toggle for the predictive buffer.",
+            "default": true
+        },
+        "custom-ticks": {
+            "type": "int",
+            "name": "Custom stage: max delay (ticks)",
+            "description": "Max tick window for Cube, Orbs, Spider, Ball, Robot, UFO, Ship, and Swing.",
+            "default": 120,
+            "min": 1,
+            "max": 400
+        },
+        "custom-wave-ticks": {
+            "type": "int",
+            "name": "Custom stage: max wave delay (ticks)",
+            "description": "Max tick window for Wave corridor deflection and spam.",
+            "default": 32,
+            "min": 1,
+            "max": 400
+        },
+        "sim-budget-ms": {
+            "type": "float",
+            "name": "Prediction time budget (ms)",
+            "description": "CPU simulation budget per frame in milliseconds.",
+            "default": 20.0,
+            "min": 1.0,
+            "max": 100.0
+        },
+        "smart-prediction": {
+            "type": "bool",
+            "name": "Orb / Pad / Portal / Hazard Snap",
+            "description": "Automatically trigger buffered inputs on orbs and intercept spike hitboxes on 100-frame-perfect jumps.",
+            "default": true
+        },
+        "open-console": {
+            "type": "bool",
+            "name": "Force CMD Console Window",
+            "description": "Automatically opens the Windows CMD console window even if Geode Platform Console is off.",
+            "default": true
+        }
+    }
+}
